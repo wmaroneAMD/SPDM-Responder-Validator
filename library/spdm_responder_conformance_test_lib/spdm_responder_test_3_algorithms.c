@@ -2224,5 +2224,6 @@ common_test_case_t m_spdm_test_group_algorithms[] = {
      spdm_test_case_algorithms_unexpected_non_identical,
      spdm_test_case_algorithms_setup_version_any,
      spdm_test_case_common_teardown},
+    // Add new test cases here.
     {COMMON_TEST_ID_END, NULL, NULL},
 };

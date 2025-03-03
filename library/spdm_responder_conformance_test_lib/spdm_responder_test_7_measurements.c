@@ -1737,60 +1737,127 @@ void spdm_test_case_measurements_invalid_request (void *test_context)
     }
 }
 
-void spdm_test_case_measurements_success_measurement_block(void *test_context)
+void spdm_test_case_measurements_success_measurement_block(void *test_context, uint8_t version)
 {
     spdm_test_context_t *spdm_test_context;
     void *spdm_context;
     libspdm_return_t status;
-    spdm_get_measurements_request_t spdm_request;
+    spdm_get_measurements_request_mine_t spdm_request;
     size_t spdm_request_size;
+    uint8_t *req_context_ptr;
     spdm_measurements_response_t *spdm_response;
     uint8_t message[LIBSPDM_MAX_SPDM_MSG_SIZE];
     size_t spdm_response_size;
+    uint8_t *resp_context_ptr;
     common_test_result_t test_result;
     spdm_measurement_block_dmtf_t *measurement_block;
     spdm_measurements_test_buffer_t *test_buffer;
     size_t hash_size;
-    uint8_t version;
+    common_test_case_id case_id;
 
     spdm_test_context = test_context;
     spdm_context = spdm_test_context->spdm_context;
     test_buffer = (void *)spdm_test_context->test_scratch_buffer;
-    version = test_buffer->version;
+    LIBSPDM_ASSERT(spdm_test_context->test_scratch_buffer_size ==
+                   offsetof(spdm_measurements_test_buffer_t, measurement_summary_hash) +
+                   test_buffer->hash_size);
+
+    LIBSPDM_ASSERT (test_buffer->version == version);
+
+    switch (version) {
+    case SPDM_MESSAGE_VERSION_10:
+        case_id = SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_10;
+        break;
+    case SPDM_MESSAGE_VERSION_11:
+        case_id = SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_11;
+        break;
+    case SPDM_MESSAGE_VERSION_12:
+        case_id = SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_12;
+        break;
+    case SPDM_MESSAGE_VERSION_13:
+        case_id = SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_13;
+        break;
+    default:
+        LIBSPDM_ASSERT(false);
+        return;
+    }
 
     common_test_record_test_message("SPDM Measurement Block\n");
+
+    /* Clear request */
     libspdm_zero_mem(&spdm_request, sizeof(spdm_request));
+    req_context_ptr = NULL;
+
+    /* Set request header */
     spdm_request.header.spdm_version = test_buffer->version;
     spdm_request.header.request_response_code = SPDM_GET_MEASUREMENTS;
     spdm_request.header.param1 = SPDM_GET_MEASUREMENTS_REQUEST_ATTRIBUTES_GENERATE_SIGNATURE;
-    spdm_request.header.param2 =
-        SPDM_GET_MEASUREMENTS_REQUEST_MEASUREMENT_OPERATION_ALL_MEASUREMENTS;
-    spdm_request.slot_id_param = 0;
+    spdm_request.header.param2 = SPDM_GET_MEASUREMENTS_REQUEST_MEASUREMENT_OPERATION_ALL_MEASUREMENTS;
+
+    /* Calculate request size, and other request parameters */
     if ((spdm_request.header.param1 &
          SPDM_GET_MEASUREMENTS_REQUEST_ATTRIBUTES_GENERATE_SIGNATURE) != 0) {
         if (test_buffer->version == SPDM_MESSAGE_VERSION_10) {
-            spdm_request_size = offsetof(spdm_get_measurements_request_t, slot_id_param);
+            /* Fields: header, nonce                  (size = 0x24) */
+            spdm_request_size = offsetof(spdm_get_measurements_request_mine_t, slot_id_param);
         } else {
-            spdm_request_size = sizeof(spdm_get_measurements_request_t);
+            /* Fields: header, nonce, slot_id_param   (size = 0x25) */
+            spdm_request_size = offsetof(spdm_get_measurements_request_mine_t, extra_space);
+            spdm_request.slot_id_param = 0;
         }
     } else {
-        spdm_request_size = offsetof(spdm_get_measurements_request_t, nonce);
+        /* Fields: header     (size = 0x04) */
+        spdm_request_size = sizeof(spdm_message_header_t);
     }
 
+    if (version == SPDM_MESSAGE_VERSION_13) {
+        /* Add Field: requester_context  (size += 0x08) */
+        req_context_ptr = (void *)&spdm_request + spdm_request_size;
+        spdm_request_size += SPDM_REQ_CONTEXT_SIZE;
+        memcpy( req_context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE );
+    }
+
+    /* Clear response */
     spdm_response = (void *)message;
     spdm_response_size = sizeof(message);
+    resp_context_ptr = NULL;
     libspdm_zero_mem(message, sizeof(message));
+
+    /* Send request, and receive response */
     status = libspdm_send_receive_data(spdm_context, NULL, false,
                                        &spdm_request, spdm_request_size,
                                        spdm_response, &spdm_response_size);
     if (LIBSPDM_STATUS_IS_ERROR(status)) {
         common_test_record_test_assertion (
-            SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS,
-            SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK, COMMON_TEST_ID_END,
+            SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, COMMON_TEST_ID_END,
             COMMON_TEST_RESULT_NOT_TESTED, "send/receive failure");
         return;
     }
 
+    /* Calculate spdm_response_size_exp, and pointers (opaque_length_ptr, signature_ptr) */
+    size_t spdm_response_size_exp;
+    uint32_t measurement_record_length;
+    uint16_t *opaque_length_ptr;
+    uint32_t signature_size;
+    uint8_t *signature_ptr;
+
+    measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
+    // signature_size = signature_flag ? test_buffer->signature_size : 0;
+    signature_size = test_buffer->signature_size;
+
+    opaque_length_ptr = (void *)spdm_response + sizeof(spdm_measurements_response_t) + measurement_record_length + SPDM_NONCE_SIZE;
+    signature_ptr     = (void *)opaque_length_ptr + sizeof(uint16_t) + *opaque_length_ptr;
+
+    spdm_response_size_exp = sizeof(spdm_measurements_response_t) + measurement_record_length
+            + SPDM_NONCE_SIZE + sizeof(uint16_t) + *opaque_length_ptr + signature_size;
+
+    if (version >= SPDM_MESSAGE_VERSION_13) {
+        resp_context_ptr       = signature_ptr;
+        signature_ptr          += SPDM_REQ_CONTEXT_SIZE;
+        spdm_response_size_exp += SPDM_REQ_CONTEXT_SIZE;
+    }
+
+    /* Check assertions */
     measurement_block = (void *)(spdm_response + 1);
     for (size_t index = 0; index < spdm_response->number_of_blocks; index++) {
         if (measurement_block->measurement_block_common_header.measurement_specification ==
@@ -1801,8 +1868,7 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context)
             test_result = COMMON_TEST_RESULT_FAIL;
         }
         common_test_record_test_assertion (
-            SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS,
-            SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK, 1,
+            SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 1,
             test_result, "MeasurementSpecification 0x%02x",
             measurement_block->measurement_block_common_header.measurement_specification);
         if (test_result == COMMON_TEST_RESULT_FAIL) {
@@ -1823,8 +1889,7 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context)
                 test_result = COMMON_TEST_RESULT_FAIL;
             }
             common_test_record_test_assertion(
-                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS,
-                SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK, 2,
+                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 2,
                 test_result, "SpdmMeasurementBlock MeasurementSize - 0x%02x",
                 measurement_block->measurement_block_common_header.measurement_size);
             if (test_result == COMMON_TEST_RESULT_FAIL)
@@ -1840,8 +1905,7 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context)
                 test_result = COMMON_TEST_RESULT_FAIL;
             }
             common_test_record_test_assertion(
-                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS,
-                SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK, 3,
+                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 3,
                 test_result, "SpdmMeasurementBlock DMTFSpecMeasurementValueSize - 0x%02x",
                 measurement_block->measurement_block_dmtf_header.dmtf_spec_measurement_value_size);
             if (test_result == COMMON_TEST_RESULT_FAIL)
@@ -1868,8 +1932,7 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context)
                 }
 
                 common_test_record_test_assertion (
-                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS,
-                    SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK, 4,
+                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 4,
                     test_result, "DMTFSpecMeasurementValueType");
 
                 if (test_result == COMMON_TEST_RESULT_FAIL) {
@@ -1884,7 +1947,44 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context)
                      measurement_block->measurement_block_common_header.
                      measurement_size);
     }
+
+    if (version >= SPDM_MESSAGE_VERSION_13) {
+        if ( memcmp(resp_context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
+            test_result = COMMON_TEST_RESULT_PASS;
+        } else {
+            test_result = COMMON_TEST_RESULT_FAIL;
+        }
+
+        common_test_record_test_assertion (
+            SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 5,
+            test_result, "SpdmMeasurementBlock : response context == requester context");
+    }
 }
+
+void spdm_test_case_measurements_success_measurement_block_10 (void *test_context)
+{
+    spdm_test_case_measurements_success_measurement_block(
+            test_context, SPDM_MESSAGE_VERSION_10 );
+}
+
+void spdm_test_case_measurements_success_measurement_block_11 (void *test_context)
+{
+    spdm_test_case_measurements_success_measurement_block(
+            test_context, SPDM_MESSAGE_VERSION_11 );
+}
+
+void spdm_test_case_measurements_success_measurement_block_12 (void *test_context)
+{
+    spdm_test_case_measurements_success_measurement_block(
+            test_context, SPDM_MESSAGE_VERSION_12 );
+}
+
+void spdm_test_case_measurements_success_measurement_block_13 (void *test_context)
+{
+    spdm_test_case_measurements_success_measurement_block(
+            test_context, SPDM_MESSAGE_VERSION_13 );
+}
+
 
 void spdm_test_case_measurements_unexpected_request_in_session (void *test_context)
 {
@@ -2036,10 +2136,10 @@ common_test_case_t m_spdm_test_group_measurements[] = {
      spdm_test_case_measurements_invalid_request,
      spdm_test_case_measurements_setup_version_any,
      spdm_test_case_common_teardown},
-    {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK,
-     "spdm_test_case_measurements_success_measurements_block",
-     spdm_test_case_measurements_success_measurement_block,
-     spdm_test_case_measurements_setup_version_any,
+    {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_10,
+     "spdm_test_case_measurements_success_measurement_block_10",
+     spdm_test_case_measurements_success_measurement_block_10,
+     spdm_test_case_measurements_setup_version_10,
      spdm_test_case_common_teardown},
     {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SUCCESS_11,
      "spdm_test_case_measurements_success_11",
@@ -2075,6 +2175,21 @@ common_test_case_t m_spdm_test_group_measurements[] = {
      "spdm_test_case_measurements_success_13_session",
      spdm_test_case_measurements_success_13_session,
      spdm_test_case_measurements_setup_version_13_session,
+     spdm_test_case_common_teardown},
+    {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_11,
+     "spdm_test_case_measurements_success_measurement_block_11",
+     spdm_test_case_measurements_success_measurement_block_11,
+     spdm_test_case_measurements_setup_version_11,
+     spdm_test_case_common_teardown},
+    {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_12,
+     "spdm_test_case_measurements_success_measurement_block_12",
+     spdm_test_case_measurements_success_measurement_block_12,
+     spdm_test_case_measurements_setup_version_12,
+     spdm_test_case_common_teardown},
+    {SPDM_RESPONDER_TEST_CASE_MEASUREMENTS_SPDM_MEASUREMENT_BLOCK_13,
+     "spdm_test_case_measurements_success_measurement_block_13",
+     spdm_test_case_measurements_success_measurement_block_13,
+     spdm_test_case_measurements_setup_version_13,
      spdm_test_case_common_teardown},
     {COMMON_TEST_ID_END, NULL, NULL},
 };

@@ -32,6 +32,23 @@ typedef struct {
 } spdm_get_measurements_request_mine_t;
 #pragma pack()
 
+#pragma pack(1)
+typedef struct {
+    /* Pointers to movable items in spdm_response */
+    spdm_measurement_block_dmtf_t*  measurement_record_ptr;
+    uint8_t*                        nonce_ptr;
+    uint16_t*                       opaque_datalen_ptr;
+    uint8_t*                        opaque_data_ptr;
+    uint8_t*                        context_ptr;
+    uint8_t*                        signature_ptr;
+
+    /* Sizes */
+    size_t                          response_size;
+    size_t                          response_nosign_size;
+    uint32_t                        measurement_record_length;
+} spdm_measurements_resp_ptrs_t;
+#pragma pack()
+
 static uint8_t m_cert_chain_buffer[SPDM_MAX_CERTIFICATE_CHAIN_SIZE];
 static size_t m_cert_chain_buffer_size;
 
@@ -382,6 +399,39 @@ bool spdm_test_case_measurements_setup_version_capabilities (void *test_context)
     return true;
 }
 
+void spdm_test_measurement_get_response_ptrs (
+    spdm_measurements_response_t    *spdm_response,
+    uint8_t                         version,
+    bool                            has_signature,
+    uint32_t                        signature_size,
+    spdm_measurements_resp_ptrs_t   *out )
+{
+    void* end_ptr;
+
+    out->measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
+
+    out->measurement_record_ptr = (void*)spdm_response              + sizeof(spdm_measurements_response_t);
+    out->nonce_ptr              = (void*)(out->measurement_record_ptr) + out->measurement_record_length;
+    out->opaque_datalen_ptr     = (void*)(out->nonce_ptr)           + SPDM_NONCE_SIZE;
+    out->opaque_data_ptr        = (void*)(out->opaque_datalen_ptr)  + sizeof(uint16_t);
+    end_ptr                     = (void*)(out->opaque_data_ptr)     + *(out->opaque_datalen_ptr);
+
+    out->context_ptr   = 0;
+    out->signature_ptr = 0;
+
+    if (version >= SPDM_MESSAGE_VERSION_13) {
+        out->context_ptr    = end_ptr;
+        end_ptr             += SPDM_REQ_CONTEXT_SIZE;
+    }
+    out->response_nosign_size = end_ptr - (void*)spdm_response;
+
+    if ( has_signature ) {
+        out->signature_ptr  = end_ptr;
+        end_ptr             += signature_size;
+    }
+    out->response_size = end_ptr - (void*)spdm_response;
+}
+
 bool spdm_test_measurement_parse_record (uint8_t number_of_blocks_in,
                                          uint32_t measurement_record_length_in,
                                          uint8_t *measurement_record,
@@ -563,18 +613,14 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
     libspdm_return_t status;
     spdm_get_measurements_request_mine_t spdm_request;
     size_t spdm_request_size;
-    bool signature_flag;
+    spdm_measurements_resp_ptrs_t rptr;
+    bool has_signature;
     uint8_t *req_context_ptr;
     spdm_measurements_response_t *spdm_response;
     uint8_t message[LIBSPDM_MAX_SPDM_MSG_SIZE];
     size_t spdm_response_size;
-    size_t spdm_response_size_exp;
     common_test_result_t test_result;
     spdm_measurements_test_buffer_t *test_buffer;
-    uint32_t measurement_record_length;
-    uint16_t *opaque_length_ptr;
-    uint32_t signature_size;
-    uint8_t *signature_ptr;
     uint8_t slot_id;
     bool result;
     uint8_t number_of_blocks_out;
@@ -661,10 +707,10 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
         spdm_request.header.param2 = SPDM_GET_MEASUREMENTS_REQUEST_MEASUREMENT_OPERATION_TOTAL_NUMBER_OF_MEASUREMENTS;
 
         /* Request a signature, if the responder supports signatures  */
-        signature_flag = ((test_buffer->rsp_cap_flags & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MEAS_CAP_SIG) != 0);
+        has_signature = ((test_buffer->rsp_cap_flags & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MEAS_CAP_SIG) != 0);
 
         /* Calculate request size, and other request parameters */
-        if ( signature_flag ) {
+        if ( has_signature ) {
             spdm_request.header.param1 = SPDM_GET_MEASUREMENTS_REQUEST_ATTRIBUTES_GENERATE_SIGNATURE;
             /* ignore spdm_request.nonce */
 
@@ -704,24 +750,13 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             return;
         }
 
-        /* Calculate spdm_response_size_exp, and pointers (opaque_length_ptr, signature_ptr) */
-        measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
-        signature_size = signature_flag ? test_buffer->signature_size : 0;
-
-        opaque_length_ptr = (void *)spdm_response + sizeof(spdm_measurements_response_t) + measurement_record_length + SPDM_NONCE_SIZE;
-        signature_ptr     = (void *)opaque_length_ptr + sizeof(uint16_t) + *opaque_length_ptr;
-
-        spdm_response_size_exp = sizeof(spdm_measurements_response_t) + measurement_record_length
-                + SPDM_NONCE_SIZE + sizeof(uint16_t) + *opaque_length_ptr + signature_size;
-
-        if (version >= SPDM_MESSAGE_VERSION_13) {
-            signature_ptr          += SPDM_REQ_CONTEXT_SIZE;
-            spdm_response_size_exp += SPDM_REQ_CONTEXT_SIZE;
-        }
-
+        /* Get pointers to data items that can move */
+        spdm_test_measurement_get_response_ptrs (
+            spdm_response, version, has_signature, test_buffer->signature_size, &rptr
+        );
 
         /* Check assertions */
-        if (spdm_response_size == spdm_response_size_exp) {
+        if (spdm_response_size == rptr.response_size) {
             test_result = COMMON_TEST_RESULT_PASS;
         } else {
             test_result = COMMON_TEST_RESULT_FAIL;
@@ -781,19 +816,19 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             return;
         }
 
-        if (measurement_record_length == 0) {
+        if (rptr.measurement_record_length == 0) {
             test_result = COMMON_TEST_RESULT_PASS;
         } else {
             test_result = COMMON_TEST_RESULT_FAIL;
         }
         common_test_record_test_assertion (
             SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 6,
-            test_result, "response measurement_record_length - 0x%06x", measurement_record_length);
+            test_result, "response measurement_record_length - 0x%06x", rptr.measurement_record_length);
         if (test_result == COMMON_TEST_RESULT_FAIL) {
             return;
         }
 
-        if ( signature_flag ) {
+        if ( has_signature ) {
 
             status = libspdm_append_message_m(spdm_context, NULL,
                                               &spdm_request, spdm_request_size);
@@ -804,8 +839,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 return;
             }
             status = libspdm_append_message_m(spdm_context, NULL,
-                                              spdm_response,
-                                              (size_t)signature_ptr - (size_t)spdm_response);
+                                              spdm_response, rptr.response_nosign_size);
             if (LIBSPDM_STATUS_IS_ERROR(status)) {
                 common_test_record_test_assertion (
                     SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 0,
@@ -849,7 +883,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             }
 
             result = libspdm_verify_measurement_signature(
-                spdm_context, NULL, signature_ptr, signature_size);
+                spdm_context, NULL, rptr.signature_ptr, test_buffer->signature_size);
             if (result) {
                 test_result = COMMON_TEST_RESULT_PASS;
             } else {
@@ -863,6 +897,17 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             }
 
             libspdm_reset_message_m (spdm_context, NULL);
+        }
+
+        if (version >= SPDM_MESSAGE_VERSION_13) {
+            if ( memcmp(rptr.context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
+                test_result = COMMON_TEST_RESULT_PASS;
+            } else {
+                test_result = COMMON_TEST_RESULT_FAIL;
+            }
+            common_test_record_test_assertion (
+                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 22,
+                test_result, "response context == requester context");
         }
 
 
@@ -880,7 +925,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
         spdm_request.header.param2 = SPDM_GET_MEASUREMENTS_REQUEST_MEASUREMENT_OPERATION_ALL_MEASUREMENTS;
 
         /* Calculate request size, and other request parameters */
-        if ( signature_flag ) {
+        if ( has_signature ) {
             spdm_request.header.param1 = SPDM_GET_MEASUREMENTS_REQUEST_ATTRIBUTES_GENERATE_SIGNATURE;
             /* ignore spdm_request.nonce */
 
@@ -920,24 +965,13 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             return;
         }
 
-        /* Calculate spdm_response_size_exp, and pointers (opaque_length_ptr, signature_ptr) */
-        measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
-        signature_size = signature_flag ? test_buffer->signature_size : 0;
-
-        opaque_length_ptr = (void *)spdm_response + sizeof(spdm_measurements_response_t) + measurement_record_length + SPDM_NONCE_SIZE;
-        signature_ptr     = (void *)opaque_length_ptr + sizeof(uint16_t) + *opaque_length_ptr;
-
-        spdm_response_size_exp = sizeof(spdm_measurements_response_t) + measurement_record_length
-                + SPDM_NONCE_SIZE + sizeof(uint16_t) + *opaque_length_ptr + signature_size;
-
-        if (version >= SPDM_MESSAGE_VERSION_13) {
-            signature_ptr          += SPDM_REQ_CONTEXT_SIZE;
-            spdm_response_size_exp += SPDM_REQ_CONTEXT_SIZE;
-        }
-
+        /* Get pointers to data items that can move */
+        spdm_test_measurement_get_response_ptrs (
+            spdm_response, version, has_signature, test_buffer->signature_size, &rptr
+        );
 
         /* Check assertions */
-        if (spdm_response_size == spdm_response_size_exp) {
+        if (spdm_response_size == rptr.response_size) {
             test_result = COMMON_TEST_RESULT_PASS;
         } else {
             test_result = COMMON_TEST_RESULT_FAIL;
@@ -974,7 +1008,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
         }
 
         spdm_test_measurement_parse_record (spdm_response->number_of_blocks,
-                                            measurement_record_length,
+                                            rptr.measurement_record_length,
                                             (void *)(spdm_response + 1),
                                             &number_of_blocks_out,
                                             &measurement_record_length_out);
@@ -992,8 +1026,8 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             return;
         }
 
-        if ((measurement_record_length > 0) &&
-            (measurement_record_length == measurement_record_length_out)) {
+        if ((rptr.measurement_record_length > 0) &&
+            (rptr.measurement_record_length == measurement_record_length_out)) {
             test_result = COMMON_TEST_RESULT_PASS;
         } else {
             test_result = COMMON_TEST_RESULT_FAIL;
@@ -1001,24 +1035,24 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
         common_test_record_test_assertion (
             SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 12,
             test_result, "response measurement_record_length - 0x%06x, get - 0x%06x",
-            measurement_record_length, measurement_record_length_out);
+            rptr.measurement_record_length, measurement_record_length_out);
         if (test_result == COMMON_TEST_RESULT_FAIL) {
             return;
         }
         libspdm_copy_mem (measurement_record, sizeof(measurement_record),
-                          (void *)(spdm_response + 1), measurement_record_length);
-        measurement_record_size = measurement_record_length;
+                          (void *)(spdm_response + 1), rptr.measurement_record_length);
+        measurement_record_size = rptr.measurement_record_length;
         measurement_block_count = spdm_response->number_of_blocks;
 
         result = spdm_test_measurement_calc_summary_hash (test_buffer->version,
                                                             test_buffer->hash_algo,
                                                             spdm_response->number_of_blocks,
-                                                            measurement_record_length,
+                                                            rptr.measurement_record_length,
                                                             (void *)(spdm_response + 1),
                                                             measurement_summary_hash,
                                                             measurement_index_mask);
 
-        if ( signature_flag ) {
+        if ( has_signature ) {
 
             status = libspdm_append_message_m(spdm_context, NULL,
                                               &spdm_request, spdm_request_size);
@@ -1029,8 +1063,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 return;
             }
             status = libspdm_append_message_m(spdm_context, NULL,
-                                              spdm_response,
-                                              (size_t)signature_ptr - (size_t)spdm_response);
+                                              spdm_response, rptr.response_nosign_size);
             if (LIBSPDM_STATUS_IS_ERROR(status)) {
                 common_test_record_test_assertion (
                     SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 0,
@@ -1046,7 +1079,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                     test_result = COMMON_TEST_RESULT_FAIL;
                 }
                 common_test_record_test_assertion (
-                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 0,
+                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 14,
                     test_result, "response param2 (slot_id) - 0x%02x",
                     spdm_response->header.param2 & SPDM_MEASUREMENTS_RESPONSE_SLOT_ID_MASK);
                 if (test_result == COMMON_TEST_RESULT_FAIL) {
@@ -1065,7 +1098,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                     test_result = COMMON_TEST_RESULT_FAIL;
                 }
                 common_test_record_test_assertion (
-                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 0,
+                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 14,
                     test_result, "response param2 (content changed) - 0x%02x",
                     spdm_response->header.param2 & SPDM_MEASUREMENTS_RESPONSE_CONTENT_CHANGE_MASK);
                 if (test_result == COMMON_TEST_RESULT_FAIL) {
@@ -1074,7 +1107,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             }
 
             result = libspdm_verify_measurement_signature(
-                spdm_context, NULL, signature_ptr, signature_size);
+                spdm_context, NULL, rptr.signature_ptr, test_buffer->signature_size);
             if (result) {
                 test_result = COMMON_TEST_RESULT_PASS;
             } else {
@@ -1089,6 +1122,18 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
 
             libspdm_reset_message_m (spdm_context, NULL);
         }
+
+        if (version >= SPDM_MESSAGE_VERSION_13) {
+            if ( memcmp(rptr.context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
+                test_result = COMMON_TEST_RESULT_PASS;
+            } else {
+                test_result = COMMON_TEST_RESULT_FAIL;
+            }
+            common_test_record_test_assertion (
+                SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 23,
+                test_result, "response context == requester context");
+        }
+
 
         /* get one-by-one */
         common_test_record_test_message ("test one by one\n");
@@ -1113,11 +1158,11 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             spdm_request.header.param2 = meas_index;
 
             /* Request a signature on the *last* measurement only */
-            signature_flag = ((test_buffer->rsp_cap_flags & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MEAS_CAP_SIG) != 0)
+            has_signature = ((test_buffer->rsp_cap_flags & SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MEAS_CAP_SIG) != 0)
                     && (meas_count == measurement_block_count);
 
             /* Calculate request size, and other request parameters */
-            if ( signature_flag ) {
+            if ( has_signature ) {
                 spdm_request.header.param1 = SPDM_GET_MEASUREMENTS_REQUEST_ATTRIBUTES_GENERATE_SIGNATURE;
                 /* ignore spdm_request.nonce */
 
@@ -1157,24 +1202,13 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 return;
             }
 
-            /* Calculate spdm_response_size_exp, and pointers (opaque_length_ptr, signature_ptr) */
-            measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
-            signature_size = signature_flag ? test_buffer->signature_size : 0;
-
-            opaque_length_ptr = (void *)spdm_response + sizeof(spdm_measurements_response_t) + measurement_record_length + SPDM_NONCE_SIZE;
-            signature_ptr     = (void *)opaque_length_ptr + sizeof(uint16_t) + *opaque_length_ptr;
-
-            spdm_response_size_exp = sizeof(spdm_measurements_response_t) + measurement_record_length
-                    + SPDM_NONCE_SIZE + sizeof(uint16_t) + *opaque_length_ptr + signature_size;
-
-            if (version >= SPDM_MESSAGE_VERSION_13) {
-                signature_ptr          += SPDM_REQ_CONTEXT_SIZE;
-                spdm_response_size_exp += SPDM_REQ_CONTEXT_SIZE;
-            }
-
+            /* Get pointers to data items that can move */
+            spdm_test_measurement_get_response_ptrs (
+                spdm_response, version, has_signature, test_buffer->signature_size, &rptr
+            );
 
             /* Check assertions */
-            if (spdm_response_size == spdm_response_size_exp) {
+            if (spdm_response_size == rptr.response_size) {
                 test_result = COMMON_TEST_RESULT_PASS;
             } else {
                 test_result = COMMON_TEST_RESULT_FAIL;
@@ -1226,8 +1260,8 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 measurement_block_count, measurement_record, measurement_record_size,
                 meas_index, &measurement_record_out, &measurement_record_length_out);
             if (result &&
-                (measurement_record_length > 0) &&
-                (measurement_record_length == measurement_record_length_out)) {
+                (rptr.measurement_record_length > 0) &&
+                (rptr.measurement_record_length == measurement_record_length_out)) {
                 test_result = COMMON_TEST_RESULT_PASS;
             } else {
                 test_result = COMMON_TEST_RESULT_FAIL;
@@ -1235,7 +1269,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
             common_test_record_test_assertion (
                 SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 19,
                 test_result, "response measurement_record_length - 0x%06x, get - 0x%06x (dup - %x)",
-                measurement_record_length, measurement_record_length_out, !result);
+                rptr.measurement_record_length, measurement_record_length_out, !result);
             if (test_result == COMMON_TEST_RESULT_FAIL) {
                 return;
             }
@@ -1262,8 +1296,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 return;
             }
             status = libspdm_append_message_m(spdm_context, NULL,
-                                              spdm_response,
-                                              (size_t)signature_ptr - (size_t)spdm_response);
+                                              spdm_response, rptr.response_nosign_size);
             if (LIBSPDM_STATUS_IS_ERROR(status)) {
                 common_test_record_test_assertion (
                     SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 0,
@@ -1271,7 +1304,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 return;
             }
 
-            if ( signature_flag ) {
+            if ( has_signature ) {
 
                 if (version >= SPDM_MESSAGE_VERSION_10) {
                     if ((spdm_response->header.param2 & SPDM_MEASUREMENTS_RESPONSE_SLOT_ID_MASK) ==
@@ -1310,7 +1343,7 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
                 }
 
                 result = libspdm_verify_measurement_signature(
-                    spdm_context, NULL, signature_ptr, signature_size);
+                    spdm_context, NULL, rptr.signature_ptr, test_buffer->signature_size );
                 if (result) {
                     test_result = COMMON_TEST_RESULT_PASS;
                 } else {
@@ -1325,6 +1358,18 @@ void spdm_test_case_measurements_success_10_11_12_13 (void *test_context, uint8_
 
                 libspdm_reset_message_m (spdm_context, NULL);
             }
+
+            if (version >= SPDM_MESSAGE_VERSION_13) {
+                if ( memcmp(rptr.context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
+                    test_result = COMMON_TEST_RESULT_PASS;
+                } else {
+                    test_result = COMMON_TEST_RESULT_FAIL;
+                }
+                common_test_record_test_assertion (
+                    SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 24,
+                    test_result, "response context == requester context");
+            }
+
         }
     }
 }
@@ -1744,11 +1789,11 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context, u
     libspdm_return_t status;
     spdm_get_measurements_request_mine_t spdm_request;
     size_t spdm_request_size;
+    spdm_measurements_resp_ptrs_t rptr;
     uint8_t *req_context_ptr;
     spdm_measurements_response_t *spdm_response;
     uint8_t message[LIBSPDM_MAX_SPDM_MSG_SIZE];
     size_t spdm_response_size;
-    uint8_t *resp_context_ptr;
     common_test_result_t test_result;
     spdm_measurement_block_dmtf_t *measurement_block;
     spdm_measurements_test_buffer_t *test_buffer;
@@ -1820,7 +1865,6 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context, u
     /* Clear response */
     spdm_response = (void *)message;
     spdm_response_size = sizeof(message);
-    resp_context_ptr = NULL;
     libspdm_zero_mem(message, sizeof(message));
 
     /* Send request, and receive response */
@@ -1835,31 +1879,13 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context, u
         return;
     }
 
-    /* Calculate spdm_response_size_exp, and pointers (opaque_length_ptr, signature_ptr) */
-    size_t spdm_response_size_exp;
-    uint32_t measurement_record_length;
-    uint16_t *opaque_length_ptr;
-    uint32_t signature_size;
-    uint8_t *signature_ptr;
-
-    measurement_record_length = libspdm_read_uint24( spdm_response->measurement_record_length );
-    // signature_size = signature_flag ? test_buffer->signature_size : 0;
-    signature_size = test_buffer->signature_size;
-
-    opaque_length_ptr = (void *)spdm_response + sizeof(spdm_measurements_response_t) + measurement_record_length + SPDM_NONCE_SIZE;
-    signature_ptr     = (void *)opaque_length_ptr + sizeof(uint16_t) + *opaque_length_ptr;
-
-    spdm_response_size_exp = sizeof(spdm_measurements_response_t) + measurement_record_length
-            + SPDM_NONCE_SIZE + sizeof(uint16_t) + *opaque_length_ptr + signature_size;
-
-    if (version >= SPDM_MESSAGE_VERSION_13) {
-        resp_context_ptr       = signature_ptr;
-        signature_ptr          += SPDM_REQ_CONTEXT_SIZE;
-        spdm_response_size_exp += SPDM_REQ_CONTEXT_SIZE;
-    }
+    /* Get pointers to data items that can move */
+    spdm_test_measurement_get_response_ptrs (
+        spdm_response, version, true, test_buffer->signature_size, &rptr
+    );
 
     /* Check assertions */
-    measurement_block = (void *)(spdm_response + 1);
+    measurement_block = rptr.measurement_record_ptr;
     for (size_t index = 0; index < spdm_response->number_of_blocks; index++) {
         if (measurement_block->measurement_block_common_header.measurement_specification ==
             SPDM_MEASUREMENT_SPECIFICATION_DMTF)
@@ -1950,12 +1976,11 @@ void spdm_test_case_measurements_success_measurement_block(void *test_context, u
     }
 
     if (version >= SPDM_MESSAGE_VERSION_13) {
-        if ( memcmp(resp_context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
+        if ( memcmp(rptr.context_ptr, req_context_str, SPDM_REQ_CONTEXT_SIZE) == 0 ) {
             test_result = COMMON_TEST_RESULT_PASS;
         } else {
             test_result = COMMON_TEST_RESULT_FAIL;
         }
-
         common_test_record_test_assertion (
             SPDM_RESPONDER_TEST_GROUP_MEASUREMENTS, case_id, 5,
             test_result, "SpdmMeasurementBlock : response context == requester context");
